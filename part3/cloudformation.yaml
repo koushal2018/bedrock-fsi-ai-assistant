@@ -1,0 +1,775 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'Financial AI Assistant - Cross-Region Deployment (Part 3)'
+
+Parameters:
+  Environment:
+    Type: String
+    Default: prod
+    AllowedValues: [dev, prod]
+    Description: Deployment environment
+
+  PrimaryRegion:
+    Type: String
+    Default: us-east-1
+    Description: Primary AWS region for this deployment
+
+  AppConfigAppId:
+    Type: String
+    Description: AppConfig Application ID (from Part 2 setup)
+
+  AppConfigEnvId:
+    Type: String
+    Description: AppConfig Environment ID
+
+  AppConfigProfileId:
+    Type: String
+    Description: AppConfig Configuration Profile ID
+
+  CircuitOpenThreshold:
+    Type: Number
+    Default: 5
+    Description: Number of failures before circuit opens
+
+  RecoveryWindowSeconds:
+    Type: Number
+    Default: 60
+    Description: Seconds circuit stays open before half-open probe
+
+  ContactNumber:
+    Type: String
+    Default: '1-800-BANK-HELP'
+    Description: Contact number for graceful degradation messages
+
+Conditions:
+  IsProd: !Equals [!Ref Environment, prod]
+
+Resources:
+
+  # ── KMS Customer Managed Key ────────────────────────────────────────────────
+  DynamoDBKMSKey:
+    Type: AWS::KMS::Key
+    Properties:
+      Description: "CMK for FinancialAI DynamoDB circuit breaker table"
+      EnableKeyRotation: true
+      KeyPolicy:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: AllowAccountRootFull
+            Effect: Allow
+            Principal:
+              AWS: !Sub "arn:aws:iam::${AWS::AccountId}:root"
+            Action: "kms:*"
+            Resource: "*"
+          - Sid: AllowLambdaUsage
+            Effect: Allow
+            Principal:
+              AWS: !GetAtt ModelAbstractionLambdaRole.Arn
+            Action:
+              - kms:GenerateDataKey
+              - kms:Decrypt
+            Resource: "*"
+      Tags:
+        - Key: Project
+          Value: FinancialAIAssistant
+        - Key: Environment
+          Value: !Ref Environment
+
+  DynamoDBKMSKeyAlias:
+    Type: AWS::KMS::Alias
+    Properties:
+      AliasName: !Sub "alias/FinancialAI-DynamoDB-${Environment}"
+      TargetKeyId: !Ref DynamoDBKMSKey
+
+  # ── DynamoDB: Circuit Breaker State ────────────────────────────────────────
+  CircuitBreakerDynamoDB:
+    Type: AWS::DynamoDB::Table
+    DeletionPolicy: Retain
+    Properties:
+      TableName: !Sub "ModelCircuitBreaker-${Environment}"
+      AttributeDefinitions:
+        - AttributeName: model_id
+          AttributeType: S
+      KeySchema:
+        - AttributeName: model_id
+          KeyType: HASH
+      BillingMode: PAY_PER_REQUEST
+      StreamSpecification:
+        StreamViewType: NEW_AND_OLD_IMAGES
+      PointInTimeRecoverySpecification:
+        PointInTimeRecoveryEnabled: true
+      SSESpecification:
+        SSEEnabled: true
+        SSEType: KMS
+        KMSMasterKeyId: !Ref DynamoDBKMSKey
+      Tags:
+        - Key: Project
+          Value: FinancialAIAssistant
+        - Key: Environment
+          Value: !Ref Environment
+
+  # ── IAM Managed Policies: Lambda ────────────────────────────────────────────
+  LambdaBedrockPolicy:
+    Type: AWS::IAM::ManagedPolicy
+    Properties:
+      ManagedPolicyName: !Sub "FinancialAI-Lambda-Bedrock-${Environment}"
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Action:
+              - bedrock:InvokeModel
+              - bedrock:InvokeModelWithResponseStream
+              - bedrock:Converse
+              - bedrock:ConverseStream
+            Resource:
+              # Scope to the specific models used by AppConfig routing rules.
+              # Add/remove ARNs here when changing the model roster.
+              - !Sub "arn:aws:bedrock:${AWS::Region}::foundation-model/amazon.nova-micro-v1:0"
+              - !Sub "arn:aws:bedrock:${AWS::Region}::foundation-model/amazon.nova-lite-v1:0"
+              - !Sub "arn:aws:bedrock:${AWS::Region}::foundation-model/amazon.nova-pro-v1:0"
+              - !Sub "arn:aws:bedrock:${AWS::Region}:${AWS::AccountId}:inference-profile/us.anthropic.claude-sonnet-4-6"
+              - !Sub "arn:aws:bedrock:${AWS::Region}:${AWS::AccountId}:inference-profile/us.anthropic.claude-opus-4-8"
+              - !Sub "arn:aws:bedrock:${AWS::Region}:${AWS::AccountId}:inference-profile/us.anthropic.claude-haiku-4-5-20251001-v1:0"
+
+  LambdaAppConfigPolicy:
+    Type: AWS::IAM::ManagedPolicy
+    Properties:
+      ManagedPolicyName: !Sub "FinancialAI-Lambda-AppConfig-${Environment}"
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Action:
+              - appconfig:StartConfigurationSession
+              - appconfig:GetLatestConfiguration
+            Resource:
+              - !Sub "arn:aws:appconfig:${AWS::Region}:${AWS::AccountId}:application/${AppConfigAppId}"
+              - !Sub "arn:aws:appconfig:${AWS::Region}:${AWS::AccountId}:application/${AppConfigAppId}/environment/${AppConfigEnvId}"
+              - !Sub "arn:aws:appconfig:${AWS::Region}:${AWS::AccountId}:application/${AppConfigAppId}/configurationprofile/${AppConfigProfileId}"
+
+  LambdaDynamoDBPolicy:
+    Type: AWS::IAM::ManagedPolicy
+    Properties:
+      ManagedPolicyName: !Sub "FinancialAI-Lambda-DynamoDB-${Environment}"
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Action:
+              - dynamodb:GetItem
+              - dynamodb:PutItem
+              - dynamodb:UpdateItem
+              - dynamodb:DescribeTable
+            Resource:
+              - !GetAtt CircuitBreakerDynamoDB.Arn
+
+  # ── IAM Role: Lambda Execution ──────────────────────────────────────────────
+  ModelAbstractionLambdaRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "FinancialAI-LambdaRole-${Environment}"
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+        - !Ref LambdaBedrockPolicy
+        - !Ref LambdaAppConfigPolicy
+        - !Ref LambdaDynamoDBPolicy
+      Tags:
+        - Key: Project
+          Value: FinancialAIAssistant
+        - Key: Environment
+          Value: !Ref Environment
+
+  # ── Lambda: Model Abstraction ───────────────────────────────────────────────
+  ModelAbstractionLambda:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub "FinancialAI-ModelAbstraction-${Environment}"
+      Handler: lambda_handler.lambda_handler
+      Role: !GetAtt ModelAbstractionLambdaRole.Arn
+      Runtime: python3.12
+      Timeout: 30
+      MemorySize: 512
+      ReservedConcurrentExecutions: !If [IsProd, 100, 10]
+      Environment:
+        Variables:
+          APPCONFIG_APP_ID: !Ref AppConfigAppId
+          APPCONFIG_ENV_ID: !Ref AppConfigEnvId
+          APPCONFIG_PROFILE_ID: !Ref AppConfigProfileId
+          CIRCUIT_BREAKER_TABLE: !Ref CircuitBreakerDynamoDB
+          POWERTOOLS_SERVICE_NAME: FinancialAIModelAbstraction
+          LOG_LEVEL: INFO
+          ENVIRONMENT: !Ref Environment
+      Code:
+        ZipFile: |
+          # Placeholder — deploy using part2/lambda_handler.py via CI/CD or aws lambda update-function-code
+          def lambda_handler(event, context):
+              raise NotImplementedError("Deploy part2/lambda_handler.py")
+      Tags:
+        - Key: Project
+          Value: FinancialAIAssistant
+        - Key: Environment
+          Value: !Ref Environment
+
+  ModelAbstractionLambdaLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub "/aws/lambda/FinancialAI-ModelAbstraction-${Environment}"
+      RetentionInDays: !If [IsProd, 90, 14]
+
+  # ── Lambda: Circuit Breaker ─────────────────────────────────────────────────
+  CircuitBreakerLambda:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub "FinancialAI-CircuitBreaker-${Environment}"
+      Handler: circuit_breaker_lambda.lambda_handler
+      Role: !GetAtt ModelAbstractionLambdaRole.Arn
+      Runtime: python3.12
+      Timeout: 10
+      MemorySize: 256
+      Environment:
+        Variables:
+          CIRCUIT_BREAKER_TABLE: !Ref CircuitBreakerDynamoDB
+          CIRCUIT_OPEN_THRESHOLD: !Ref CircuitOpenThreshold
+          RECOVERY_WINDOW_SECONDS: !Ref RecoveryWindowSeconds
+          LOG_LEVEL: INFO
+      Code:
+        ZipFile: |
+          # Placeholder — deploy using part3/circuit_breaker_lambda.py
+          def lambda_handler(event, context):
+              raise NotImplementedError("Deploy part3/circuit_breaker_lambda.py")
+      Tags:
+        - Key: Project
+          Value: FinancialAIAssistant
+        - Key: Environment
+          Value: !Ref Environment
+
+  # ── Lambda: Graceful Degradation ────────────────────────────────────────────
+  DegradationLambda:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub "FinancialAI-Degradation-${Environment}"
+      Handler: degradation_lambda.lambda_handler
+      Role: !GetAtt ModelAbstractionLambdaRole.Arn
+      Runtime: python3.12
+      Timeout: 5
+      MemorySize: 256
+      Environment:
+        Variables:
+          CONTACT_NUMBER: !Ref ContactNumber
+          LOG_LEVEL: WARNING
+      Code:
+        ZipFile: |
+          # Placeholder — deploy using part3/degradation_lambda.py
+          def lambda_handler(event, context):
+              raise NotImplementedError("Deploy part3/degradation_lambda.py")
+      Tags:
+        - Key: Project
+          Value: FinancialAIAssistant
+        - Key: Environment
+          Value: !Ref Environment
+
+  # ── IAM Managed Policies (replacing inline policies per security best practice) ─
+  StateMachineInvokeLambdaPolicy:
+    Type: AWS::IAM::ManagedPolicy
+    Properties:
+      ManagedPolicyName: !Sub "FinancialAI-SFN-InvokeLambdas-${Environment}"
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Action: lambda:InvokeFunction
+            Resource:
+              - !GetAtt ModelAbstractionLambda.Arn
+              - !GetAtt CircuitBreakerLambda.Arn
+              - !GetAtt DegradationLambda.Arn
+
+  StateMachineLoggingPolicy:
+    Type: AWS::IAM::ManagedPolicy
+    Properties:
+      ManagedPolicyName: !Sub "FinancialAI-SFN-Logging-${Environment}"
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Action:
+              - logs:CreateLogDelivery
+              - logs:GetLogDelivery
+              - logs:UpdateLogDelivery
+              - logs:DeleteLogDelivery
+              - logs:ListLogDeliveries
+              - logs:PutLogEvents
+              - logs:PutResourcePolicy
+              - logs:DescribeResourcePolicies
+              - logs:DescribeLogGroups
+            # Scoped to FinancialAI log groups; Step Functions log delivery APIs
+            # require the log group ARN, not wildcard.
+            Resource:
+              - !GetAtt StateMachineLogGroup.Arn
+              - !Sub "${StateMachineLogGroup.Arn}:*"
+          - Effect: Allow
+            # X-Ray does not support resource-level permissions — wildcard is required.
+            Action:
+              - xray:PutTraceSegments
+              - xray:PutTelemetryRecords
+              - xray:GetSamplingRules
+              - xray:GetSamplingTargets
+            Resource: '*'
+
+  # ── IAM Role: Step Functions ────────────────────────────────────────────────
+  StateMachineRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "FinancialAI-StateMachineRole-${Environment}"
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: !Sub "states.${AWS::Region}.amazonaws.com"
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - !Ref StateMachineInvokeLambdaPolicy
+        - !Ref StateMachineLoggingPolicy
+      Tags:
+        - Key: Project
+          Value: FinancialAIAssistant
+        - Key: Environment
+          Value: !Ref Environment
+
+  StateMachineLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub "/aws/states/FinancialAI-${Environment}"
+      RetentionInDays: !If [IsProd, 90, 14]
+
+  # ── Step Functions: Express State Machine ───────────────────────────────────
+  AIAssistantStateMachine:
+    Type: AWS::StepFunctions::StateMachine
+    Properties:
+      StateMachineName: !Sub "FinancialAI-CircuitBreaker-${Environment}"
+      StateMachineType: EXPRESS
+      RoleArn: !GetAtt StateMachineRole.Arn
+      LoggingConfiguration:
+        Level: ALL
+        IncludeExecutionData: true
+        Destinations:
+          - CloudWatchLogsLogGroup:
+              LogGroupArn: !GetAtt StateMachineLogGroup.Arn
+      TracingConfiguration:
+        Enabled: true
+      DefinitionSubstitutions:
+        PrimaryModelLambdaArn: !GetAtt ModelAbstractionLambda.Arn
+        FallbackModelLambdaArn: !GetAtt ModelAbstractionLambda.Arn
+        CircuitBreakerLambdaArn: !GetAtt CircuitBreakerLambda.Arn
+        DegradationLambdaArn: !GetAtt DegradationLambda.Arn
+      Definition:
+        Comment: "Financial AI Assistant with Circuit Breaker Pattern"
+        StartAt: CheckCircuitBreaker
+        States:
+          CheckCircuitBreaker:
+            Type: Task
+            Resource: "arn:aws:states:::lambda:invoke"
+            Parameters:
+              FunctionName: "${CircuitBreakerLambdaArn}"
+              Payload:
+                operation: check
+                "model_id.$": "$.primary_model"
+            ResultSelector:
+              "circuit_open.$": "$.Payload.circuit_open"
+              "failure_count.$": "$.Payload.failure_count"
+            ResultPath: "$.circuit_state"
+            Next: IsCircuitOpen
+            Catch:
+              - ErrorEquals: ["States.ALL"]
+                Next: TryPrimaryModel
+                ResultPath: "$.circuit_check_error"
+          IsCircuitOpen:
+            Type: Choice
+            Choices:
+              - Variable: "$.circuit_state.circuit_open"
+                BooleanEquals: true
+                Next: TryFallbackModel
+            Default: TryPrimaryModel
+          TryPrimaryModel:
+            Type: Task
+            Resource: "arn:aws:states:::lambda:invoke"
+            Parameters:
+              FunctionName: "${PrimaryModelLambdaArn}"
+              Payload:
+                "prompt.$": "$.prompt"
+                "use_case.$": "$.use_case"
+                "constraints.$": "$.constraints"
+                "model_override.$": "$.primary_model"
+            ResultSelector:
+              "model_used.$": "$.Payload.model_used"
+              "response.$": "$.Payload.response"
+              "latency_ms.$": "$.Payload.latency_ms"
+              "input_tokens.$": "$.Payload.input_tokens"
+              "output_tokens.$": "$.Payload.output_tokens"
+              "estimated_cost_usd.$": "$.Payload.estimated_cost_usd"
+            ResultPath: "$.model_result"
+            TimeoutSeconds: 25
+            Retry:
+              - ErrorEquals: ["Lambda.TooManyRequestsException"]
+                IntervalSeconds: 1
+                MaxAttempts: 2
+                BackoffRate: 2.0
+                JitterStrategy: FULL
+            Catch:
+              - ErrorEquals: ["States.ALL"]
+                Next: RecordPrimaryFailure
+                ResultPath: "$.primary_error"
+            Next: RecordSuccess
+          RecordSuccess:
+            Type: Task
+            Resource: "arn:aws:states:::lambda:invoke"
+            Parameters:
+              FunctionName: "${CircuitBreakerLambdaArn}"
+              Payload:
+                operation: record_success
+                "model_id.$": "$.primary_model"
+            ResultPath: null
+            Next: SuccessState
+            Catch:
+              - ErrorEquals: ["States.ALL"]
+                Next: SuccessState
+                ResultPath: null
+          RecordPrimaryFailure:
+            Type: Task
+            Resource: "arn:aws:states:::lambda:invoke"
+            Parameters:
+              FunctionName: "${CircuitBreakerLambdaArn}"
+              Payload:
+                operation: record_failure
+                "model_id.$": "$.primary_model"
+                "error.$": "$.primary_error"
+            ResultPath: null
+            Next: TryFallbackModel
+            Catch:
+              - ErrorEquals: ["States.ALL"]
+                Next: TryFallbackModel
+                ResultPath: null
+          TryFallbackModel:
+            Type: Task
+            Resource: "arn:aws:states:::lambda:invoke"
+            Parameters:
+              FunctionName: "${FallbackModelLambdaArn}"
+              Payload:
+                "prompt.$": "$.prompt"
+                "use_case.$": "$.use_case"
+                "constraints.$": "$.constraints"
+                is_fallback: true
+            ResultSelector:
+              "model_used.$": "$.Payload.model_used"
+              "response.$": "$.Payload.response"
+              "latency_ms.$": "$.Payload.latency_ms"
+              "input_tokens.$": "$.Payload.input_tokens"
+              "output_tokens.$": "$.Payload.output_tokens"
+              "estimated_cost_usd.$": "$.Payload.estimated_cost_usd"
+            ResultPath: "$.model_result"
+            TimeoutSeconds: 20
+            Retry:
+              - ErrorEquals: ["Lambda.TooManyRequestsException"]
+                IntervalSeconds: 2
+                MaxAttempts: 2
+                BackoffRate: 2.0
+                JitterStrategy: FULL
+            Catch:
+              - ErrorEquals: ["States.ALL"]
+                Next: GracefulDegradation
+                ResultPath: "$.fallback_error"
+            Next: FallbackSuccessState
+          FallbackSuccessState:
+            Type: Pass
+            Parameters:
+              "model_used.$": "$.model_result.model_used"
+              "response.$": "$.model_result.response"
+              "latency_ms.$": "$.model_result.latency_ms"
+              "input_tokens.$": "$.model_result.input_tokens"
+              "output_tokens.$": "$.model_result.output_tokens"
+              "estimated_cost_usd.$": "$.model_result.estimated_cost_usd"
+              served_by: FALLBACK
+            End: true
+          GracefulDegradation:
+            Type: Task
+            Resource: "arn:aws:states:::lambda:invoke"
+            Parameters:
+              FunctionName: "${DegradationLambdaArn}"
+              Payload:
+                "prompt.$": "$.prompt"
+                "use_case.$": "$.use_case"
+            ResultSelector:
+              "model_used.$": "$.Payload.model_used"
+              "response.$": "$.Payload.response"
+              degraded: true
+            ResultPath: "$.model_result"
+            Next: DegradedState
+          DegradedState:
+            Type: Pass
+            Parameters:
+              model_used: DEGRADED_SERVICE
+              "response.$": "$.model_result.response"
+              latency_ms: 0
+              input_tokens: 0
+              output_tokens: 0
+              estimated_cost_usd: 0
+              served_by: DEGRADED
+            End: true
+          SuccessState:
+            Type: Pass
+            Parameters:
+              "model_used.$": "$.model_result.model_used"
+              "response.$": "$.model_result.response"
+              "latency_ms.$": "$.model_result.latency_ms"
+              "input_tokens.$": "$.model_result.input_tokens"
+              "output_tokens.$": "$.model_result.output_tokens"
+              "estimated_cost_usd.$": "$.model_result.estimated_cost_usd"
+              served_by: PRIMARY
+            End: true
+      Tags:
+        - Key: Project
+          Value: FinancialAIAssistant
+        - Key: Environment
+          Value: !Ref Environment
+
+  # ── IAM Role: API Gateway → Step Functions ──────────────────────────────────
+  ApiGatewayStepFunctionsPolicy:
+    Type: AWS::IAM::ManagedPolicy
+    Properties:
+      ManagedPolicyName: !Sub "FinancialAI-APIGW-StepFunctions-${Environment}"
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Action: states:StartSyncExecution
+            Resource: !Ref AIAssistantStateMachine
+          - Effect: Allow
+            Action:
+              - logs:CreateLogGroup
+              - logs:CreateLogStream
+              - logs:DescribeLogGroups
+              - logs:DescribeLogStreams
+              - logs:PutLogEvents
+              - logs:GetLogEvents
+              - logs:FilterLogEvents
+            Resource: !Sub "arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/apigateway/*"
+
+  ApiGatewayRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "FinancialAI-ApiGatewayRole-${Environment}"
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: apigateway.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - !Ref ApiGatewayStepFunctionsPolicy
+      Tags:
+        - Key: Project
+          Value: FinancialAIAssistant
+        - Key: Environment
+          Value: !Ref Environment
+
+  # ── API Gateway ─────────────────────────────────────────────────────────────
+  AIAssistantAPI:
+    Type: AWS::ApiGateway::RestApi
+    Properties:
+      Name: !Sub "FinancialAIAssistantAPI-${Environment}"
+      Description: "Financial AI Assistant API — routes to Step Functions circuit breaker"
+      EndpointConfiguration:
+        Types: [REGIONAL]
+      Tags:
+        - Key: Project
+          Value: FinancialAIAssistant
+        - Key: Environment
+          Value: !Ref Environment
+
+  GenerateResource:
+    Type: AWS::ApiGateway::Resource
+    Properties:
+      RestApiId: !Ref AIAssistantAPI
+      ParentId: !GetAtt AIAssistantAPI.RootResourceId
+      PathPart: generate
+
+  GenerateMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref AIAssistantAPI
+      ResourceId: !Ref GenerateResource
+      HttpMethod: POST
+      AuthorizationType: AWS_IAM
+      Integration:
+        Type: AWS
+        IntegrationHttpMethod: POST
+        Uri: !Sub "arn:aws:apigateway:${AWS::Region}:states:action/StartSyncExecution"
+        Credentials: !GetAtt ApiGatewayRole.Arn
+        RequestTemplates:
+          application/json: !Sub |
+            {
+              "stateMachineArn": "${AIAssistantStateMachine}",
+              "input": "$util.escapeJavaScript($input.body)"
+            }
+        IntegrationResponses:
+          - StatusCode: 200
+            ResponseTemplates:
+              application/json: |
+                #set($output = $util.parseJson($input.path('$.output')))
+                $output
+          - StatusCode: 400
+            SelectionPattern: '4\d{2}'
+            ResponseTemplates:
+              application/json: '{"error": "Bad Request", "message": "$input.path(''$.errorMessage'')"}'
+          - StatusCode: 500
+            SelectionPattern: '5\d{2}'
+            ResponseTemplates:
+              application/json: '{"error": "Internal Server Error"}'
+      MethodResponses:
+        - StatusCode: 200
+          ResponseModels:
+            application/json: Empty
+        - StatusCode: 400
+        - StatusCode: 500
+
+  HealthResource:
+    Type: AWS::ApiGateway::Resource
+    Properties:
+      RestApiId: !Ref AIAssistantAPI
+      ParentId: !GetAtt AIAssistantAPI.RootResourceId
+      PathPart: health
+
+  HealthMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref AIAssistantAPI
+      ResourceId: !Ref HealthResource
+      HttpMethod: GET
+      # Health endpoint is intentionally public (no auth) — returns static 200.
+      # It contains no backend data and does not proxy to any AWS resource.
+      AuthorizationType: NONE
+      Integration:
+        Type: MOCK
+        RequestTemplates:
+          application/json: '{"statusCode": 200}'
+        IntegrationResponses:
+          - StatusCode: 200
+            ResponseTemplates:
+              application/json: !Sub |
+                {"status": "healthy", "service": "FinancialAIAssistant", "environment": "${Environment}", "region": "${AWS::Region}"}
+      MethodResponses:
+        - StatusCode: 200
+
+  ApiDeployment:
+    Type: AWS::ApiGateway::Deployment
+    DependsOn:
+      - GenerateMethod
+      - HealthMethod
+    Properties:
+      RestApiId: !Ref AIAssistantAPI
+      Description: !Sub "Deployment for ${Environment}"
+
+  ApiClientCertificate:
+    Type: AWS::ApiGateway::ClientCertificate
+    Properties:
+      Description: "Client certificate for mutual TLS between API Gateway and backend"
+      Tags:
+        - Key: Project
+          Value: FinancialAIAssistant
+
+  ApiStage:
+    Type: AWS::ApiGateway::Stage
+    Metadata:
+      # checkov:skip=CKV_AWS_59:ClientCertificateId is set via !Ref ApiClientCertificate
+      # above; Checkov cannot resolve CloudFormation intrinsic functions at static
+      # analysis time. The client certificate is provisioned and attached at deploy time.
+      checkov:
+        skip:
+          - id: CKV_AWS_59
+            comment: "ClientCertificateId set via !Ref ApiClientCertificate — verified at deploy time"
+    Properties:
+      RestApiId: !Ref AIAssistantAPI
+      DeploymentId: !Ref ApiDeployment
+      StageName: !Ref Environment
+      ClientCertificateId: !Ref ApiClientCertificate
+      TracingEnabled: true
+      AccessLogSetting:
+        DestinationArn: !GetAtt ApiAccessLogGroup.Arn
+        Format: >
+          {"requestId":"$context.requestId","ip":"$context.identity.sourceIp",
+           "caller":"$context.identity.caller","requestTime":"$context.requestTime",
+           "httpMethod":"$context.httpMethod","resourcePath":"$context.resourcePath",
+           "status":"$context.status","protocol":"$context.protocol",
+           "responseLength":"$context.responseLength","latency":"$context.responseLatency"}
+      MethodSettings:
+        - ResourcePath: '/*'
+          HttpMethod: '*'
+          ThrottlingBurstLimit: 100
+          ThrottlingRateLimit: 50
+          LoggingLevel: INFO
+          DataTraceEnabled: false
+          MetricsEnabled: true
+      Tags:
+        Project: FinancialAIAssistant
+        Environment: !Ref Environment
+
+  ApiAccessLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub "/aws/apigateway/FinancialAI-${Environment}"
+      RetentionInDays: !If [IsProd, 90, 14]
+
+Outputs:
+  ApiEndpoint:
+    Description: API Gateway invoke URL
+    Value: !Sub "https://${AIAssistantAPI}.execute-api.${AWS::Region}.amazonaws.com/${Environment}"
+    Export:
+      Name: !Sub "FinancialAI-ApiEndpoint-${Environment}"
+
+  GenerateEndpoint:
+    Description: Full URL for /generate endpoint
+    Value: !Sub "https://${AIAssistantAPI}.execute-api.${AWS::Region}.amazonaws.com/${Environment}/generate"
+
+  StateMachineArn:
+    Description: Step Functions state machine ARN
+    Value: !Ref AIAssistantStateMachine
+    Export:
+      Name: !Sub "FinancialAI-StateMachineArn-${Environment}"
+
+  LambdaArn:
+    Description: Model abstraction Lambda ARN
+    Value: !GetAtt ModelAbstractionLambda.Arn
+    Export:
+      Name: !Sub "FinancialAI-LambdaArn-${Environment}"
+
+  DynamoDBTableName:
+    Description: Circuit breaker DynamoDB table name
+    Value: !Ref CircuitBreakerDynamoDB
+    Export:
+      Name: !Sub "FinancialAI-CircuitBreakerTable-${Environment}"
+
+  CircuitBreakerLambdaArn:
+    Description: Circuit breaker Lambda ARN
+    Value: !GetAtt CircuitBreakerLambda.Arn
+
+  DegradationLambdaArn:
+    Description: Graceful degradation Lambda ARN
+    Value: !GetAtt DegradationLambda.Arn
+
+  DeployCommand:
+    Description: CLI command to deploy this stack
+    Value: !Sub >-
+      aws cloudformation deploy
+      --template-file part3/cloudformation.yaml
+      --stack-name financial-ai-assistant-${Environment}
+      --parameter-overrides Environment=${Environment} AppConfigAppId=YOUR_APP_ID AppConfigEnvId=YOUR_ENV_ID AppConfigProfileId=YOUR_PROFILE_ID
+      --region ${AWS::Region}
+      --capabilities CAPABILITY_NAMED_IAM

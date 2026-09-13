@@ -1,0 +1,257 @@
+{
+  "Comment": "Financial AI Assistant with Circuit Breaker Pattern",
+  "StartAt": "CheckCircuitBreaker",
+  "States": {
+    "CheckCircuitBreaker": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::lambda:invoke",
+      "Parameters": {
+        "FunctionName": "${CircuitBreakerLambdaArn}",
+        "Payload": {
+          "operation": "check",
+          "model_id.$": "$.primary_model",
+          "input.$": "$"
+        }
+      },
+      "ResultSelector": {
+        "circuit_open.$": "$.Payload.circuit_open",
+        "failure_count.$": "$.Payload.failure_count"
+      },
+      "ResultPath": "$.circuit_state",
+      "Next": "IsCircuitOpen",
+      "Retry": [
+        {
+          "ErrorEquals": ["States.TaskFailed", "Lambda.SdkClientException"],
+          "IntervalSeconds": 1,
+          "MaxAttempts": 2,
+          "BackoffRate": 1.5
+        }
+      ],
+      "Catch": [
+        {
+          "ErrorEquals": ["States.ALL"],
+          "Next": "TryPrimaryModel",
+          "ResultPath": "$.circuit_check_error"
+        }
+      ]
+    },
+    "IsCircuitOpen": {
+      "Type": "Choice",
+      "Choices": [
+        {
+          "Variable": "$.circuit_state.circuit_open",
+          "BooleanEquals": true,
+          "Next": "TryFallbackModel"
+        }
+      ],
+      "Default": "TryPrimaryModel"
+    },
+    "TryPrimaryModel": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::lambda:invoke",
+      "Parameters": {
+        "FunctionName": "${PrimaryModelLambdaArn}",
+        "Payload": {
+          "prompt.$": "$.prompt",
+          "use_case.$": "$.use_case",
+          "constraints.$": "$.constraints",
+          "model_override.$": "$.primary_model"
+        }
+      },
+      "ResultSelector": {
+        "model_used.$": "$.Payload.model_used",
+        "response.$": "$.Payload.response",
+        "latency_ms.$": "$.Payload.latency_ms",
+        "input_tokens.$": "$.Payload.input_tokens",
+        "output_tokens.$": "$.Payload.output_tokens",
+        "estimated_cost_usd.$": "$.Payload.estimated_cost_usd"
+      },
+      "ResultPath": "$.model_result",
+      "Retry": [
+        {
+          "ErrorEquals": ["Lambda.TooManyRequestsException", "States.TaskFailed"],
+          "IntervalSeconds": 1,
+          "MaxAttempts": 2,
+          "BackoffRate": 2.0,
+          "JitterStrategy": "FULL"
+        }
+      ],
+      "Catch": [
+        {
+          "ErrorEquals": [
+            "Lambda.AWSLambdaException",
+            "Lambda.SdkClientException",
+            "States.TaskFailed",
+            "States.Timeout"
+          ],
+          "Next": "RecordPrimaryFailure",
+          "ResultPath": "$.primary_error"
+        }
+      ],
+      "Next": "RecordSuccess",
+      "TimeoutSeconds": 25
+    },
+    "RecordSuccess": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::lambda:invoke",
+      "Parameters": {
+        "FunctionName": "${CircuitBreakerLambdaArn}",
+        "Payload": {
+          "operation": "record_success",
+          "model_id.$": "$.primary_model"
+        }
+      },
+      "ResultPath": null,
+      "Next": "SuccessState",
+      "Retry": [
+        {
+          "ErrorEquals": ["States.ALL"],
+          "IntervalSeconds": 1,
+          "MaxAttempts": 1,
+          "BackoffRate": 1.0
+        }
+      ],
+      "Catch": [
+        {
+          "ErrorEquals": ["States.ALL"],
+          "Next": "SuccessState",
+          "ResultPath": null
+        }
+      ]
+    },
+    "RecordPrimaryFailure": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::lambda:invoke",
+      "Parameters": {
+        "FunctionName": "${CircuitBreakerLambdaArn}",
+        "Payload": {
+          "operation": "record_failure",
+          "model_id.$": "$.primary_model",
+          "error.$": "$.primary_error"
+        }
+      },
+      "ResultPath": null,
+      "Next": "TryFallbackModel",
+      "Retry": [
+        {
+          "ErrorEquals": ["States.ALL"],
+          "IntervalSeconds": 1,
+          "MaxAttempts": 1,
+          "BackoffRate": 1.0
+        }
+      ],
+      "Catch": [
+        {
+          "ErrorEquals": ["States.ALL"],
+          "Next": "TryFallbackModel",
+          "ResultPath": null
+        }
+      ]
+    },
+    "TryFallbackModel": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::lambda:invoke",
+      "Parameters": {
+        "FunctionName": "${FallbackModelLambdaArn}",
+        "Payload": {
+          "prompt.$": "$.prompt",
+          "use_case.$": "$.use_case",
+          "constraints.$": "$.constraints",
+          "is_fallback": true
+        }
+      },
+      "ResultSelector": {
+        "model_used.$": "$.Payload.model_used",
+        "response.$": "$.Payload.response",
+        "latency_ms.$": "$.Payload.latency_ms",
+        "input_tokens.$": "$.Payload.input_tokens",
+        "output_tokens.$": "$.Payload.output_tokens",
+        "estimated_cost_usd.$": "$.Payload.estimated_cost_usd"
+      },
+      "ResultPath": "$.model_result",
+      "Retry": [
+        {
+          "ErrorEquals": ["Lambda.TooManyRequestsException"],
+          "IntervalSeconds": 2,
+          "MaxAttempts": 2,
+          "BackoffRate": 2.0,
+          "JitterStrategy": "FULL"
+        }
+      ],
+      "Catch": [
+        {
+          "ErrorEquals": ["States.ALL"],
+          "Next": "GracefulDegradation",
+          "ResultPath": "$.fallback_error"
+        }
+      ],
+      "Next": "FallbackSuccessState",
+      "TimeoutSeconds": 20
+    },
+    "FallbackSuccessState": {
+      "Type": "Pass",
+      "Parameters": {
+        "model_used.$": "$.model_result.model_used",
+        "response.$": "$.model_result.response",
+        "latency_ms.$": "$.model_result.latency_ms",
+        "input_tokens.$": "$.model_result.input_tokens",
+        "output_tokens.$": "$.model_result.output_tokens",
+        "estimated_cost_usd.$": "$.model_result.estimated_cost_usd",
+        "served_by": "FALLBACK"
+      },
+      "End": true
+    },
+    "GracefulDegradation": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::lambda:invoke",
+      "Parameters": {
+        "FunctionName": "${DegradationLambdaArn}",
+        "Payload": {
+          "prompt.$": "$.prompt",
+          "use_case.$": "$.use_case"
+        }
+      },
+      "ResultSelector": {
+        "model_used.$": "$.Payload.model_used",
+        "response.$": "$.Payload.response",
+        "degraded": true
+      },
+      "ResultPath": "$.model_result",
+      "Next": "DegradedState",
+      "Retry": [
+        {
+          "ErrorEquals": ["States.ALL"],
+          "IntervalSeconds": 1,
+          "MaxAttempts": 2,
+          "BackoffRate": 1.0
+        }
+      ]
+    },
+    "DegradedState": {
+      "Type": "Pass",
+      "Parameters": {
+        "model_used": "DEGRADED_SERVICE",
+        "response.$": "$.model_result.response",
+        "latency_ms": 0,
+        "input_tokens": 0,
+        "output_tokens": 0,
+        "estimated_cost_usd": 0,
+        "served_by": "DEGRADED"
+      },
+      "End": true
+    },
+    "SuccessState": {
+      "Type": "Pass",
+      "Parameters": {
+        "model_used.$": "$.model_result.model_used",
+        "response.$": "$.model_result.response",
+        "latency_ms.$": "$.model_result.latency_ms",
+        "input_tokens.$": "$.model_result.input_tokens",
+        "output_tokens.$": "$.model_result.output_tokens",
+        "estimated_cost_usd.$": "$.model_result.estimated_cost_usd",
+        "served_by": "PRIMARY"
+      },
+      "End": true
+    }
+  }
+}

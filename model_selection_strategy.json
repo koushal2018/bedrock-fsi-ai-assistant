@@ -1,0 +1,102 @@
+{
+  "generated_at": "2026-09-13T10:50:36.238173Z",
+  "primary_model": "zai.glm-5",
+  "fallback_models": [
+    "us.anthropic.claude-sonnet-4-6",
+    "mistral.mistral-large-3-675b-instruct",
+    "moonshotai.kimi-k2.5"
+  ],
+  "use_case_models": {
+    "compliance_check": "zai.glm-5",
+    "product_faq": "mistral.ministral-3-3b-instruct",
+    "customer_service": "us.anthropic.claude-sonnet-4-6",
+    "complex_query": "zai.glm-5"
+  },
+  "routing_rules": {
+    "economy": "mistral.ministral-3-3b-instruct",
+    "standard": "mistral.mistral-large-3-675b-instruct",
+    "premium": "zai.glm-5"
+  },
+  "model_scores": [
+    {
+      "model_id": "zai.glm-5",
+      "composite_score": 0.9192,
+      "accuracy": 0.88,
+      "latency_p50_s": 0.611,
+      "guardrail_score": 1.0,
+      "avg_cost_per_request": "$0.000067"
+    },
+    {
+      "model_id": "us.anthropic.claude-sonnet-4-6",
+      "composite_score": 0.9096,
+      "accuracy": 0.92,
+      "latency_p50_s": 1.086,
+      "guardrail_score": 1.0,
+      "avg_cost_per_request": "$0.000487"
+    },
+    {
+      "model_id": "mistral.mistral-large-3-675b-instruct",
+      "composite_score": 0.88,
+      "accuracy": 0.87,
+      "latency_p50_s": 0.52,
+      "guardrail_score": 0.9,
+      "avg_cost_per_request": "$0.000118"
+    },
+    {
+      "model_id": "moonshotai.kimi-k2.5",
+      "composite_score": 0.8649,
+      "accuracy": 0.9,
+      "latency_p50_s": 1.024,
+      "guardrail_score": 0.9,
+      "avg_cost_per_request": "$0.000170"
+    },
+    {
+      "model_id": "meta.llama3-70b-instruct-v1:0",
+      "composite_score": 0.8552,
+      "accuracy": 0.71,
+      "latency_p50_s": 0.536,
+      "guardrail_score": 1.0,
+      "avg_cost_per_request": "$0.000101"
+    },
+    {
+      "model_id": "qwen.qwen3-next-80b-a3b",
+      "composite_score": 0.8363,
+      "accuracy": 0.85,
+      "latency_p50_s": 0.44,
+      "guardrail_score": 0.8,
+      "avg_cost_per_request": "$0.000057"
+    },
+    {
+      "model_id": "deepseek.v3.2",
+      "composite_score": 0.8358,
+      "accuracy": 0.86,
+      "latency_p50_s": 0.524,
+      "guardrail_score": 0.8,
+      "avg_cost_per_request": "$0.000018"
+    },
+    {
+      "model_id": "google.gemma-3-27b-it",
+      "composite_score": 0.8213,
+      "accuracy": 0.71,
+      "latency_p50_s": 0.422,
+      "guardrail_score": 0.9,
+      "avg_cost_per_request": "$0.000034"
+    },
+    {
+      "model_id": "us.anthropic.claude-haiku-4-5-20251001-v1:0",
+      "composite_score": 0.8067,
+      "accuracy": 0.85,
+      "latency_p50_s": 0.991,
+      "guardrail_score": 0.8,
+      "avg_cost_per_request": "$0.000130"
+    },
+    {
+      "model_id": "amazon.nova-pro-v1:0",
+      "composite_score": 0.7257,
+      "accuracy": 0.79,
+      "latency_p50_s": 0.563,
+      "guardrail_score": 0.6,
+      "avg_cost_per_request": "$0.000107"
+    }
+  ]
+}

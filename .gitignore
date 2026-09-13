@@ -1,0 +1,42 @@
+# ── Benchmark outputs (large, timestamped — not source code) ─────────────────
+fsi_mmlu_raw_*.csv
+fsi_mmlu_leaderboard_*.csv
+fsi_mmlu_run.log
+fsi_*_rerun.log
+fsi_*_run.log
+guardrail_results_*.csv
+model_comparison_*.csv
+
+# ── AWS resource IDs and live config (contain account/resource identifiers) ───
+part2/appconfig_ids.env
+part2/api_endpoint.env
+
+# ── Lambda deployment packages ────────────────────────────────────────────────
+*.zip
+part3/sf_resolved.json
+part3/sf_eu.json
+
+# ── Tool scaffolding (not project source) ────────────────────────────────────
+.claude/
+.holmes/
+registered_agents.json
+task_agent_mapping.json
+app_Config.py
+selection_strategy.py
+
+# ── Node / JS ─────────────────────────────────────────────────────────────────
+node_modules/
+package-lock.json
+
+# ── Python ────────────────────────────────────────────────────────────────────
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+venv/
+*.egg-info/
+dist/
+build/
+
+# ── macOS ─────────────────────────────────────────────────────────────────────
+.DS_Store
